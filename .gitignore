@@ -1,0 +1,69 @@
+## Build output (tracked separately via publish/) ##
+bin/
+obj/
+
+## .NET / C# ##
+bin/
+obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+.vs/
+*.swp
+*.*~
+project.lock.json
+artifacts/
+
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+bld/
+[Bb]uild/
+[Bb]uilds/
+[Pp]ublish/
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+!**/packages/repositories.config
+
+# MSTest
+TestResults/
+[Tt]est[Rr]esult*/
+
+# Rider
+.idea/
+
+# VS Code
+.vscode/
+
+## Secrets / Sensitive ##
+*.env
+.env
+.env.*
+appsettings.Development.json
+appsettings.Local.json
+secrets.json
+
+## OS ##
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+
+## Logs ##
+*.log
+logs/
+
+## Large model files ##
+*.onnx
+*.gguf
+*.bin
