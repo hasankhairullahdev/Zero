@@ -147,6 +147,9 @@ public sealed class SpeechRecognizer : IAsyncDisposable
         return text;
     }
 
+    // Minimum trimmed audio size before sending to Whisper (~0.5s at 16kHz 16-bit mono = 16000 bytes)
+    private const int MinAudioBytes = 16000;
+
     private async Task<string> TranscribeAsync(byte[] wavBytes, CancellationToken ct)
     {
         if (_processorBuilder is null)
@@ -157,6 +160,13 @@ public sealed class SpeechRecognizer : IAsyncDisposable
         _log.LogInformation("Audio trimmed: {Before} -> {After} bytes",
             wavBytes.Length, trimmedBytes.Length);
 
+        // Skip transcription if audio is too short — likely just noise
+        if (trimmedBytes.Length < MinAudioBytes)
+        {
+            _log.LogInformation("Audio too short ({Bytes} bytes) — skipping transcription.", trimmedBytes.Length);
+            return string.Empty;
+        }
+
         // Fresh processor per call — avoids internal KV-cache state accumulation
         await using var processor = _processorBuilder.Build();
 
@@ -166,8 +176,59 @@ public sealed class SpeechRecognizer : IAsyncDisposable
         await foreach (var segment in processor.ProcessAsync(ms, ct))
             sb.Append(segment.Text);
 
-        return sb.ToString().Trim();
+        var raw = sb.ToString().Trim();
+        return IsHallucination(raw) ? string.Empty : raw;
     }
+
+    /// <summary>
+    /// Detect common Whisper hallucinations — repetitive phrases, non-Latin gibberish,
+    /// or known phantom strings that appear on silence/noise.
+    /// </summary>
+    private static bool IsHallucination(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return false;
+
+        // Non-Latin scripts on a Windows UI assistant are almost always hallucinations
+        // (Arabic, CJK, Devanagari, etc.) — ZERO is English/Indonesian only
+        foreach (var ch in text)
+        {
+            if (ch > 127 && !IsLatinExtended(ch))
+                return true;
+        }
+
+        // Known Whisper phantom phrases on silence
+        var lower = text.ToLowerInvariant();
+        string[] phantoms =
+        [
+            "we ask god",
+            "thank you for watching",
+            "thanks for watching",
+            "please subscribe",
+            "subhanallah",
+            "اللہ",
+            "ご視聴",
+        ];
+        foreach (var p in phantoms)
+            if (lower.Contains(p)) return true;
+
+        // Repetition detection: same word repeated 3+ times = hallucination
+        var words = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (words.Length >= 3)
+        {
+            for (int i = 0; i <= words.Length - 3; i++)
+            {
+                if (string.Equals(words[i], words[i + 1], StringComparison.OrdinalIgnoreCase) &&
+                    string.Equals(words[i], words[i + 2], StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static bool IsLatinExtended(char ch) =>
+        // Allow Latin-1 Supplement + Latin Extended A/B (covers Indonesian, European languages)
+        ch is (>= '\u00C0' and <= '\u024F');
 
     /// <summary>
     /// Trim trailing silence from a 16kHz 16-bit mono WAV byte array.
