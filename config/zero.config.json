@@ -19,7 +19,7 @@
   "OllamaNumGpu": 33,
 
   "EnableWakeWord": true,
-  "WakeWordThreshold": 0.75,
+  "WakeWordThreshold": 0.88,
 
   "EnableMemory": true,
 
