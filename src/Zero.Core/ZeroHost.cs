@@ -335,18 +335,10 @@ public sealed class ZeroHost : BackgroundService
                 return;
             }
 
-            // Strip the wake word trigger phrase from the beginning
-            text = StripWakeWordPrefix(text);
-
             if (string.IsNullOrWhiteSpace(text))
             {
-                // Wake word but no command — prompt user
+                // Wake word terdeteksi tapi tidak ada command — resume saja
                 Console.WriteLine("[ZERO] (wake word detected, no command heard)\n");
-                if (_cfg.EnableTts && _tts.IsReady)
-                {
-                    try { await _tts.SpeakAsync("Yes?", CancellationToken.None); }
-                    catch { /* non-critical */ }
-                }
                 _tray.SetState(TrayManager.TrayState.Idle);
                 _wakeWord.Resume();
                 return;
@@ -356,18 +348,6 @@ public sealed class ZeroHost : BackgroundService
             await ProcessInputAsync(text, CancellationToken.None);
             _wakeWord.Resume();
         });
-    }
-
-    /// <summary>Remove "hey jarvis", "hey zero", etc. prefix from transcription.</summary>
-    private static string StripWakeWordPrefix(string text)
-    {
-        var lower = text.ToLowerInvariant().TrimStart();
-        foreach (var prefix in new[] { "hey jarvis,", "hey jarvis", "jarvis," })
-        {
-            if (lower.StartsWith(prefix))
-                return text[prefix.Length..].TrimStart(',', ' ');
-        }
-        return text;
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
