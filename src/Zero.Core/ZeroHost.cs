@@ -428,7 +428,7 @@ public sealed class ZeroHost : BackgroundService
                 ChatMessage? assistantMsg;
                 try
                 {
-                    var model = _modelRouter.Route(userInput);
+                    var model = _modelRouter.Route(userInput, hasTools: _tools.Count > 0);
                     assistantMsg = await _ollama.ChatAsync(_history, _tools, _cfg.EnableThinking, model, ct);
                 }
                 catch (OperationCanceledException) { break; }

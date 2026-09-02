@@ -75,7 +75,7 @@ public sealed class ModelRouter
     /// Determine which model tier to use for the given input.
     /// Pass hasImages=true when the turn includes image attachments.
     /// </summary>
-    public string Route(string input, bool hasImages = false)
+    public string Route(string input, bool hasImages = false, bool hasTools = true)
     {
         if (!_cfg.EnableModelRouting)
         {
@@ -100,8 +100,9 @@ public sealed class ModelRouter
             return _cfg.ModelName;
         }
 
-        // Fast tier — short input OR fast keywords, and fast model is configured
-        if (!string.IsNullOrWhiteSpace(_cfg.FastModelName))
+        // Fast tier — only when tools are NOT active (pure text/chitchat turns)
+        // qwen3:1.7b is too small for reliable tool-call formatting
+        if (!string.IsNullOrWhiteSpace(_cfg.FastModelName) && !hasTools)
         {
             var wordCount = input.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries).Length;
             if (wordCount <= 8 || ContainsAny(input, _fastKeywords))
