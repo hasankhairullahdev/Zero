@@ -129,10 +129,8 @@ public sealed class WakeWordListener : IAsyncDisposable
     {
         if (!_cfg.EnableWakeWord || _wwSession is null) return Task.CompletedTask;
 
-        _cts    = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        _waveIn = new WaveInEvent { WaveFormat = WavFmt, BufferMilliseconds = 40 };
-        _waveIn.DataAvailable    += OnData;
-        _waveIn.StartRecording();
+        _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        StartMic();
 
         _log.LogInformation("Wake word listener started — say 'Hey Jarvis' to activate.");
         return Task.CompletedTask;
@@ -141,22 +139,58 @@ public sealed class WakeWordListener : IAsyncDisposable
     public Task StopAsync()
     {
         _cts?.Cancel();
-        _waveIn?.StopRecording();
-        _waveIn?.Dispose();
-        _waveIn = null;
+        StopMic();
         return Task.CompletedTask;
     }
 
-    public void Pause()  => _paused = true;
-
-    public void Resume()
+    /// <summary>
+    /// Physically stop the microphone while the main pipeline runs.
+    /// This prevents ZERO's own TTS output from being picked up.
+    /// </summary>
+    public void Pause()
     {
+        _paused = true;
+        StopMic();
+    }
+
+    /// <summary>
+    /// Resume microphone after the pipeline + TTS finishes.
+    /// Small delay ensures TTS audio has fully cleared from the mic.
+    /// </summary>
+    public void Resume(int delayMs = 800)
+    {
+        // Reset capture state
         _capturing = false;
         _captureWriter?.Dispose();
         _captureStream?.Dispose();
         _captureWriter = null;
         _captureStream = null;
-        _paused        = false;
+        _framePos      = 0;
+
+        // Delay then restart mic on thread pool so we don't block caller
+        Task.Run(async () =>
+        {
+            await Task.Delay(delayMs);
+            if (_cts?.IsCancellationRequested == true) return;
+            _paused = false;
+            StartMic();
+        });
+    }
+
+    private void StartMic()
+    {
+        if (_waveIn is not null) return; // already running
+        _waveIn = new WaveInEvent { WaveFormat = WavFmt, BufferMilliseconds = 40 };
+        _waveIn.DataAvailable += OnData;
+        _waveIn.StartRecording();
+    }
+
+    private void StopMic()
+    {
+        if (_waveIn is null) return;
+        try { _waveIn.StopRecording(); } catch { /* ignore */ }
+        _waveIn.Dispose();
+        _waveIn = null;
     }
 
     // ── NAudio data handler ───────────────────────────────────────────────────
