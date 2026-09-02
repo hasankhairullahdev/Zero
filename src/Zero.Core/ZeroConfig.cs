@@ -6,8 +6,17 @@ public sealed class ZeroConfig
     /// <summary>Ollama base URL (default: http://127.0.0.1:11434)</summary>
     public string OllamaBaseUrl { get; set; } = "http://127.0.0.1:11434";
 
-    /// <summary>LLM model name (e.g. qwen3:32b)</summary>
-    public string ModelName { get; set; } = "qwen3:32b";
+    /// <summary>LLM model name — used as main/fallback model (e.g. qwen3:8b)</summary>
+    public string ModelName { get; set; } = "qwen3:8b";
+
+    /// <summary>Fast lightweight model for simple commands (e.g. qwen3:1.7b). Empty = disabled.</summary>
+    public string FastModelName { get; set; } = "qwen3:1.7b";
+
+    /// <summary>Vision-language model for image context (e.g. qwen3-vl:8b). Empty = disabled.</summary>
+    public string VisionModelName { get; set; } = "";
+
+    /// <summary>Enable rule-based model routing (fast/main/vision tiers).</summary>
+    public bool EnableModelRouting { get; set; } = true;
 
     /// <summary>System prompt sent at the start of every conversation.</summary>
     public string SystemPrompt { get; set; } =

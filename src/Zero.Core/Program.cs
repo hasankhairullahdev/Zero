@@ -56,6 +56,7 @@ builder.Services.AddHttpClient<OllamaClient>((sp, client) =>
 // ── Core services ─────────────────────────────────────────────────────────────
 builder.Services.AddSingleton<McpClientManager>();
 builder.Services.AddSingleton<ToolCallRouter>();
+builder.Services.AddSingleton<ModelRouter>();
 builder.Services.AddSingleton<HotkeyListener>();
 builder.Services.AddSingleton<SpeechRecognizer>();
 builder.Services.AddSingleton<KokoroTtsService>();

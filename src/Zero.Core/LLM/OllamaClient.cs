@@ -38,11 +38,12 @@ public sealed class OllamaClient
         List<ChatMessage> messages,
         List<OllamaTool>?  tools           = null,
         bool               enableThinking  = false,
+        string?            modelName       = null,
         CancellationToken  ct              = default)
     {
         var request = new ChatRequest
         {
-            Model    = _cfg.ModelName,
+            Model    = modelName ?? _cfg.ModelName,
             Messages = messages,
             Tools    = tools,
             Stream   = false,

@@ -22,6 +22,7 @@ namespace Zero.Core;
 public sealed class ZeroHost : BackgroundService
 {
     private readonly OllamaClient              _ollama;
+    private readonly ModelRouter               _modelRouter;
     private readonly ToolCallRouter            _router;
     private readonly McpClientManager          _mcp;
     private readonly HotkeyListener            _hotkey;
@@ -49,6 +50,7 @@ public sealed class ZeroHost : BackgroundService
 
     public ZeroHost(
         OllamaClient              ollama,
+        ModelRouter               modelRouter,
         ToolCallRouter            router,
         McpClientManager          mcp,
         HotkeyListener            hotkey,
@@ -60,8 +62,9 @@ public sealed class ZeroHost : BackgroundService
         IOptions<ZeroConfig>      cfg,
         ILogger<ZeroHost>         log)
     {
-        _ollama   = ollama;
-        _router   = router;
+        _ollama      = ollama;
+        _modelRouter = modelRouter;
+        _router      = router;
         _mcp      = mcp;
         _hotkey   = hotkey;
         _stt      = stt;
@@ -425,7 +428,8 @@ public sealed class ZeroHost : BackgroundService
                 ChatMessage? assistantMsg;
                 try
                 {
-                    assistantMsg = await _ollama.ChatAsync(_history, _tools, _cfg.EnableThinking, ct);
+                    var model = _modelRouter.Route(userInput);
+                    assistantMsg = await _ollama.ChatAsync(_history, _tools, _cfg.EnableThinking, model, ct);
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex)

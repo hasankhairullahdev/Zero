@@ -48,6 +48,11 @@ public sealed class ChatMessage
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Content { get; set; }
 
+    /// <summary>Base64-encoded images for vision models.</summary>
+    [JsonPropertyName("images")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<string>? Images { get; set; }
+
     [JsonPropertyName("tool_calls")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public List<ToolCall>? ToolCalls { get; set; }
