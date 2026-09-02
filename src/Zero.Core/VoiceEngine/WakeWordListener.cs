@@ -43,9 +43,11 @@ public sealed class WakeWordListener : IAsyncDisposable
     private const int MelBufSize   = WwWindows * WwStackSize;   // 48 mel frames total
 
     // ── Capture / VAD ─────────────────────────────────────────────────────────
-    private const int CaptureMaxMs   = 6000;
-    private const int SilenceMs      = 1200;
-    private const double SilenceRms  = 0.005;
+    private const int CaptureMaxMs      = 6000;  // max recording after wake word
+    private const int SilenceMs         = 1000;  // silence duration to end capture
+    private const int NoSpeechTimeoutMs = 2500;  // if no speech detected after this → false positive
+    private const double SpeechRmsMin   = 0.02;  // RMS above this = user is speaking
+    private const double SilenceRmsMul  = 1.5;   // silence = noise_floor * this multiplier
 
     // ── Model URLs ────────────────────────────────────────────────────────────
     private static readonly string ModelDir =
@@ -75,6 +77,12 @@ public sealed class WakeWordListener : IAsyncDisposable
     private readonly byte[] _frameAccum = new byte[FrameBytes];
     private int              _framePos;
 
+    // Noise floor (measured at startup over first 1s of audio)
+    private double  _noiseFloor     = 0.008; // conservative default
+    private int     _noiseFrames;
+    private double  _noiseAccum;
+    private bool    _noiseMeasured;
+
     // Post-wake capture state
     private volatile bool   _paused;
     private volatile bool   _capturing;
@@ -82,6 +90,7 @@ public sealed class WakeWordListener : IAsyncDisposable
     private WaveFileWriter? _captureWriter;
     private int             _silenceSamples;
     private int             _capturedSamples;
+    private bool            _speechDetected;  // true once user speech RMS seen during capture
 
     private WaveInEvent?              _waveIn;
     private CancellationTokenSource?  _cts;
@@ -207,6 +216,20 @@ public sealed class WakeWordListener : IAsyncDisposable
             return;
         }
 
+        // Measure noise floor from first ~1s of audio (16 × 1280-sample frames)
+        if (!_noiseMeasured)
+        {
+            double rms = ComputeRms(e.Buffer, e.BytesRecorded);
+            _noiseAccum += rms;
+            _noiseFrames++;
+            if (_noiseFrames >= 16)
+            {
+                _noiseFloor  = _noiseAccum / _noiseFrames;
+                _noiseMeasured = true;
+                _log.LogInformation("Wake word noise floor measured: {Rms:F4}", _noiseFloor);
+            }
+        }
+
         // Accumulate into 1280-sample frames
         int src = 0;
         while (src < e.BytesRecorded)
@@ -300,11 +323,12 @@ public sealed class WakeWordListener : IAsyncDisposable
         _capturing       = true;
         _silenceSamples  = 0;
         _capturedSamples = 0;
+        _speechDetected  = false;
         _captureStream   = new MemoryStream();
         _captureWriter   = new WaveFileWriter(_captureStream, WavFmt);
 
-        // Prepend last 0.5s of ring buffer (catches any trailing command words)
-        var pre = ReadRingLast(16000 * 2 / 2);
+        // Prepend last 0.3s of ring buffer
+        var pre = ReadRingLast(16000 * 2 * 300 / 1000);
         _captureWriter.Write(pre, 0, pre.Length);
         _capturedSamples += pre.Length / 2;
     }
@@ -316,22 +340,29 @@ public sealed class WakeWordListener : IAsyncDisposable
         _captureWriter.Write(buf, 0, count);
         _capturedSamples += count / 2;
 
-        // Measure RMS energy for VAD
-        double rms = 0;
-        for (int i = 0; i + 1 < count; i += 2)
+        double rms          = ComputeRms(buf, count);
+        double silenceFloor = _noiseFloor * SilenceRmsMul;
+
+        // Track if user has actually spoken (above background noise + minimum speech level)
+        if (rms > Math.Max(silenceFloor, SpeechRmsMin))
         {
-            float s = BitConverter.ToInt16(buf, i) / 32768f;
-            rms += s * s;
+            _speechDetected = true;
+            _silenceSamples = 0;
         }
-        rms = Math.Sqrt(rms / (count / 2));
+        else if (_speechDetected)
+        {
+            // Only count silence AFTER speech has been detected
+            _silenceSamples += count / 2;
+        }
 
-        if (rms < SilenceRms) _silenceSamples += count / 2;
-        else                   _silenceSamples  = 0;
+        bool silenceMet    = _speechDetected
+                             && _silenceSamples >= WavFmt.SampleRate * SilenceMs / 1000;
+        bool maxReached    = _capturedSamples   >= WavFmt.SampleRate * CaptureMaxMs / 1000;
+        // False positive: no speech after timeout → discard
+        bool noSpeechAbort = !_speechDetected
+                             && _capturedSamples >= WavFmt.SampleRate * NoSpeechTimeoutMs / 1000;
 
-        bool silenceMet = _silenceSamples  >= WavFmt.SampleRate * SilenceMs / 1000;
-        bool maxReached = _capturedSamples >= WavFmt.SampleRate * CaptureMaxMs / 1000;
-
-        if (!silenceMet && !maxReached) return;
+        if (!silenceMet && !maxReached && !noSpeechAbort) return;
 
         _capturing = false;
         _captureWriter.Flush();
@@ -341,10 +372,30 @@ public sealed class WakeWordListener : IAsyncDisposable
         _captureWriter = null;
         _captureStream = null;
 
+        if (noSpeechAbort)
+        {
+            _log.LogInformation("Wake word false positive — no speech detected, discarding.");
+            // Don't fire event — just resume listening
+            Task.Run(() => WakeWordDetected?.Invoke(this, []));
+            return;
+        }
+
         _log.LogInformation("Post-wake capture: {Bytes} bytes ({Reason})",
             wavBytes.Length, silenceMet ? "silence" : "max");
 
         Task.Run(() => WakeWordDetected?.Invoke(this, wavBytes));
+    }
+
+    private static double ComputeRms(byte[] buf, int count)
+    {
+        double sum = 0;
+        int samples = count / 2;
+        for (int i = 0; i + 1 < count; i += 2)
+        {
+            float s = BitConverter.ToInt16(buf, i) / 32768f;
+            sum += s * s;
+        }
+        return samples > 0 ? Math.Sqrt(sum / samples) : 0;
     }
 
     // ── Ring buffer ───────────────────────────────────────────────────────────

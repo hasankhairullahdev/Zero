@@ -317,6 +317,13 @@ public sealed class ZeroHost : BackgroundService
     {
         _ = Task.Run(async () =>
         {
+            // Empty array = false positive discarded by WakeWordListener
+            if (wavBytes.Length == 0)
+            {
+                _wakeWord.Resume();
+                return;
+            }
+
             // Pause wake word while we handle this turn
             _wakeWord.Pause();
             _tray.SetState(TrayManager.TrayState.Listening);
