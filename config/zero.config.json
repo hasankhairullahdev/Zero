@@ -9,7 +9,7 @@
   "WebAccessProjectPath": "src/Zero.WebAccess/Zero.WebAccess.csproj",
   "EnableThinking": false,
   "WhisperModel": "Medium",
-  "WhisperLanguage": "id",
+  "WhisperLanguage": "auto",
   "TtsRate": 0,
   "TtsVolume": 100,
   "EnableTts": true,
@@ -19,7 +19,7 @@
   "OllamaNumGpu": 33,
 
   "EnableWakeWord": true,
-  "WakeWordThreshold": 0.88,
+  "WakeWordThreshold": 0.92,
 
   "EnableMemory": true,
 
