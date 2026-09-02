@@ -43,7 +43,7 @@ public sealed class WakeWordListener : IAsyncDisposable
 
     private const string ModelFileName = "hey_jarvis_v0.1.onnx";
     private const string ModelUrl =
-        "https://github.com/dscripka/openWakeWord/releases/download/v0.6.0/hey_jarvis_v0.1.onnx";
+        "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/hey_jarvis_v0.1.onnx";
 
     // ── State ──────────────────────────────────────────────────────────────────
     private readonly ZeroConfig                 _cfg;
@@ -76,7 +76,7 @@ public sealed class WakeWordListener : IAsyncDisposable
 
     private const string MelModelFileName = "melspectrogram.onnx";
     private const string MelModelUrl =
-        "https://github.com/dscripka/openWakeWord/releases/download/v0.6.0/melspectrogram.onnx";
+        "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/melspectrogram.onnx";
 
     public WakeWordListener(IOptions<ZeroConfig> cfg, ILogger<WakeWordListener> log)
     {
