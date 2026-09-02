@@ -317,14 +317,7 @@ public sealed class ZeroHost : BackgroundService
     {
         _ = Task.Run(async () =>
         {
-            // Empty array = false positive discarded by WakeWordListener
-            if (wavBytes.Length == 0)
-            {
-                _wakeWord.Resume();
-                return;
-            }
-
-            // Pause wake word while we handle this turn
+            // Pause wake word while we handle this turn (mic already stopped in WakeWordListener)
             _wakeWord.Pause();
             _tray.SetState(TrayManager.TrayState.Listening);
             Console.WriteLine("\n[ZERO] 🎙  Wake word detected — transcribing...");

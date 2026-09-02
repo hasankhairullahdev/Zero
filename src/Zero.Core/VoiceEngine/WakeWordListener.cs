@@ -176,6 +176,11 @@ public sealed class WakeWordListener : IAsyncDisposable
         _captureStream = null;
         _framePos      = 0;
 
+        // Reset noise floor measurement so it re-calibrates on next mic start
+        _noiseMeasured = false;
+        _noiseFrames   = 0;
+        _noiseAccum    = 0;
+
         // Delay then restart mic on thread pool so we don't block caller
         Task.Run(async () =>
         {
@@ -375,8 +380,14 @@ public sealed class WakeWordListener : IAsyncDisposable
         if (noSpeechAbort)
         {
             _log.LogInformation("Wake word false positive — no speech detected, discarding.");
-            // Don't fire event — just resume listening
-            Task.Run(() => WakeWordDetected?.Invoke(this, []));
+            // Resume mic directly without firing event — ZeroHost never paused for this
+            _capturing = false;
+            _paused    = false;
+            _framePos  = 0;
+            _noiseMeasured = false;
+            _noiseFrames   = 0;
+            _noiseAccum    = 0;
+            StartMic();
             return;
         }
 
