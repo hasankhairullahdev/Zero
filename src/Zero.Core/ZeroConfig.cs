@@ -65,4 +65,30 @@ public sealed class ZeroConfig
     /// null = let Ollama decide (default). Set e.g. 20 to offload some layers to CPU.
     /// </summary>
     public int? OllamaNumGpu { get; set; } = null;
+
+    // ── Wake Word ─────────────────────────────────────────────────────────────
+
+    /// <summary>Enable always-on wake word detection ("Hey Jarvis" via OpenWakeWord ONNX).</summary>
+    public bool EnableWakeWord { get; set; } = true;
+
+    /// <summary>OpenWakeWord detection confidence threshold (0.0–1.0). Default: 0.5.</summary>
+    public double WakeWordThreshold { get; set; } = 0.5;
+
+    // ── Memory ────────────────────────────────────────────────────────────────
+
+    /// <summary>Persist conversation history across sessions.</summary>
+    public bool EnableMemory { get; set; } = true;
+
+    // ── Daily Briefing ────────────────────────────────────────────────────────
+
+    /// <summary>Deliver a spoken daily briefing once per morning (5am–11am).</summary>
+    public bool EnableDailyBriefing { get; set; } = true;
+
+    // ── Notifications ─────────────────────────────────────────────────────────
+
+    /// <summary>Show a tray balloon notification after each ZERO reply.</summary>
+    public bool EnableReplyNotification { get; set; } = true;
+
+    /// <summary>Max characters of reply shown in tray notification. 0 = disabled.</summary>
+    public int NotificationMaxChars { get; set; } = 80;
 }

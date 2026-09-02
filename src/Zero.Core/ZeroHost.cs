@@ -12,9 +12,12 @@ namespace Zero.Core;
 /// Main ZERO background service.
 /// - Text mode:  reads from Console or text-input popup (Ctrl+Shift+Z)
 /// - Voice mode: Ctrl+Shift+Space → record mic → Whisper STT → LLM → Kokoro TTS
+/// - Wake word:  "Hey Jarvis" → record via VAD → Whisper STT → LLM → Kokoro TTS
 /// Both modes share the same agentic LLM loop.
 /// Ctrl+Shift+X cancels any in-progress response.
-/// Tray icon reflects current state (idle/listening/processing).
+/// Tray icon reflects current state (idle/listening/processing) with animation.
+/// Memory persists conversation history across sessions.
+/// Daily briefing spoken once per morning.
 /// </summary>
 public sealed class ZeroHost : BackgroundService
 {
@@ -22,9 +25,11 @@ public sealed class ZeroHost : BackgroundService
     private readonly ToolCallRouter            _router;
     private readonly McpClientManager          _mcp;
     private readonly HotkeyListener            _hotkey;
-    private readonly SpeechRecognizer  _stt;
-    private readonly KokoroTtsService  _tts;
-    private readonly TrayManager       _tray;
+    private readonly SpeechRecognizer          _stt;
+    private readonly KokoroTtsService          _tts;
+    private readonly TrayManager               _tray;
+    private readonly WakeWordListener          _wakeWord;
+    private readonly SessionMemory             _memory;
     private readonly ILogger<ZeroHost>         _log;
     private readonly ZeroConfig                _cfg;
 
@@ -47,21 +52,25 @@ public sealed class ZeroHost : BackgroundService
         ToolCallRouter            router,
         McpClientManager          mcp,
         HotkeyListener            hotkey,
-        SpeechRecognizer  stt,
-        KokoroTtsService  tts,
-        TrayManager       tray,
+        SpeechRecognizer          stt,
+        KokoroTtsService          tts,
+        TrayManager               tray,
+        WakeWordListener          wakeWord,
+        SessionMemory             memory,
         IOptions<ZeroConfig>      cfg,
         ILogger<ZeroHost>         log)
     {
-        _ollama = ollama;
-        _router = router;
-        _mcp    = mcp;
-        _hotkey = hotkey;
-        _stt    = stt;
-        _tts    = tts;
-        _tray   = tray;
-        _cfg    = cfg.Value;
-        _log    = log;
+        _ollama   = ollama;
+        _router   = router;
+        _mcp      = mcp;
+        _hotkey   = hotkey;
+        _stt      = stt;
+        _tts      = tts;
+        _tray     = tray;
+        _wakeWord = wakeWord;
+        _memory   = memory;
+        _cfg      = cfg.Value;
+        _log      = log;
     }
 
     protected override async Task ExecuteAsync(CancellationToken ct)
@@ -75,10 +84,9 @@ public sealed class ZeroHost : BackgroundService
             _log.LogInformation("Exit requested from tray.");
             _ = StopAsync(ct);
         };
-        // Tray "Open text input" button → same as Ctrl+Shift+Z
         _tray.OpenTextInputRequested += (_, _) => ShowTextInputPopup();
 
-        // Initialise MCP servers (wait for Ollama in background, MCP can init independently)
+        // Initialise MCP servers in background
         _ = Task.Run(async () =>
         {
             await WaitForOllamaAsync(ct);
@@ -90,6 +98,10 @@ public sealed class ZeroHost : BackgroundService
         // Seed system prompt
         _history.Add(new ChatMessage { Role = "system", Content = _cfg.SystemPrompt });
 
+        // Load persisted memory AFTER system prompt
+        if (_cfg.EnableMemory)
+            _memory.Load(_history);
+
         _tray.SetState(TrayManager.TrayState.Idle);
         _log.LogInformation("ZERO ready. Waiting for Ollama + tools in background...");
 
@@ -98,14 +110,19 @@ public sealed class ZeroHost : BackgroundService
         Console.WriteLine("║  Type a command and press Enter.             ║");
         if (_cfg.EnableStt)
             Console.WriteLine("║  Ctrl+Shift+Space  → voice input             ║");
+        if (_cfg.EnableWakeWord)
+            Console.WriteLine("║  Say 'Hey Jarvis'  → wake word               ║");
         Console.WriteLine("║  Ctrl+Shift+Z      → text input popup        ║");
         Console.WriteLine("║  Ctrl+Shift+X      → cancel response         ║");
         Console.WriteLine("╚══════════════════════════════════════════════╝\n");
 
-        // Initialise STT + TTS in background so text input is immediately available
+        // Wire hotkeys
+        _hotkey.TextInputRequested += (_, _) => ShowTextInputPopup();
+        _hotkey.CancelRequested    += (_, _) => CancelCurrentTurn();
+
+        // Initialise STT + TTS + wake word in background
         _ = Task.Run(async () =>
         {
-            // STT and TTS init run concurrently to reduce total startup time
             var sttTask = _cfg.EnableStt
                 ? Task.Run(async () =>
                 {
@@ -124,6 +141,31 @@ public sealed class ZeroHost : BackgroundService
                 : Task.CompletedTask;
 
             await Task.WhenAll(sttTask, ttsTask);
+
+            // Wake word listener (depends on STT being ready for shared Whisper)
+            if (_cfg.EnableWakeWord)
+            {
+                try
+                {
+                    await _wakeWord.InitialiseAsync(ct);
+                    _wakeWord.WakeWordDetected += OnWakeWordDetected;
+                    await _wakeWord.StartAsync(ct);
+                }
+                catch (Exception ex) { _log.LogWarning(ex, "Wake word init failed."); }
+            }
+
+            // Daily briefing — only after TTS ready
+            if (_cfg.EnableDailyBriefing && _cfg.EnableTts && _tts.IsReady)
+            {
+                var briefing = DailyBriefing.TryGenerate(_log);
+                if (briefing is not null)
+                {
+                    Console.WriteLine($"\nZERO (briefing): {briefing}\n");
+                    try { await _tts.SpeakAsync(briefing, ct); }
+                    catch (Exception ex) { _log.LogWarning(ex, "Daily briefing TTS failed."); }
+                    return; // skip regular greeting if briefing was delivered
+                }
+            }
 
             // Startup greeting — only after TTS is fully ready
             if (_cfg.EnableTts && _cfg.StartupGreeting && _tts.IsReady)
@@ -163,10 +205,6 @@ public sealed class ZeroHost : BackgroundService
             }
         }, ct);
 
-        // Wire Ctrl+Shift+Z and Ctrl+Shift+X
-        _hotkey.TextInputRequested += (_, _) => ShowTextInputPopup();
-        _hotkey.CancelRequested    += (_, _) => CancelCurrentTurn();
-
         await TextInputLoopAsync(ct);
     }
 
@@ -195,7 +233,6 @@ public sealed class ZeroHost : BackgroundService
 
     private void ShowTextInputPopup()
     {
-        // The form must run on the tray's STA thread — post to it
         _tray.PostToStaThread(() =>
         {
             _textInputForm ??= new TextInputForm();
@@ -234,6 +271,7 @@ public sealed class ZeroHost : BackgroundService
             if (!_isRecording)
             {
                 _isRecording = true;
+                _wakeWord.Pause();
                 _tray.SetState(TrayManager.TrayState.Listening);
                 Console.WriteLine("\n[ZERO] 🎙  Listening... (press hotkey again to send)");
                 await _stt.StartRecordingAsync();
@@ -253,6 +291,7 @@ public sealed class ZeroHost : BackgroundService
                 {
                     _log.LogError(ex, "STT failed.");
                     _tray.SetState(TrayManager.TrayState.Idle);
+                    _wakeWord.Resume();
                     Console.WriteLine("[ZERO] STT error — please try again.\n");
                     return;
                 }
@@ -261,23 +300,82 @@ public sealed class ZeroHost : BackgroundService
                 {
                     Console.WriteLine("[ZERO] (nothing heard)\n");
                     _tray.SetState(TrayManager.TrayState.Idle);
+                    _wakeWord.Resume();
                     return;
                 }
 
                 Console.WriteLine($"You (voice): {text}");
                 await ProcessInputAsync(text, CancellationToken.None);
+                _wakeWord.Resume();
             }
         });
     }
 
+    // ── Wake word handler ─────────────────────────────────────────────────────
+
+    private void OnWakeWordDetected(object? sender, byte[] wavBytes)
+    {
+        _ = Task.Run(async () =>
+        {
+            // Pause wake word while we handle this turn
+            _wakeWord.Pause();
+            _tray.SetState(TrayManager.TrayState.Listening);
+            Console.WriteLine("\n[ZERO] 🎙  Wake word detected — transcribing...");
+
+            string text;
+            try
+            {
+                text = await _stt.TranscribeWavBytesAsync(wavBytes);
+            }
+            catch (Exception ex)
+            {
+                _log.LogError(ex, "Wake word STT failed.");
+                _tray.SetState(TrayManager.TrayState.Idle);
+                _wakeWord.Resume();
+                return;
+            }
+
+            // Strip the wake word trigger phrase from the beginning
+            text = StripWakeWordPrefix(text);
+
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                // Wake word but no command — prompt user
+                Console.WriteLine("[ZERO] (wake word detected, no command heard)\n");
+                if (_cfg.EnableTts && _tts.IsReady)
+                {
+                    try { await _tts.SpeakAsync("Yes?", CancellationToken.None); }
+                    catch { /* non-critical */ }
+                }
+                _tray.SetState(TrayManager.TrayState.Idle);
+                _wakeWord.Resume();
+                return;
+            }
+
+            Console.WriteLine($"You (wake): {text}");
+            await ProcessInputAsync(text, CancellationToken.None);
+            _wakeWord.Resume();
+        });
+    }
+
+    /// <summary>Remove "hey jarvis", "hey zero", etc. prefix from transcription.</summary>
+    private static string StripWakeWordPrefix(string text)
+    {
+        var lower = text.ToLowerInvariant().TrimStart();
+        foreach (var prefix in new[] { "hey jarvis,", "hey jarvis", "jarvis," })
+        {
+            if (lower.StartsWith(prefix))
+                return text[prefix.Length..].TrimStart(',', ' ');
+        }
+        return text;
+    }
+
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    /// <summary>Split text into speakable sentences to reduce TTS latency.</summary>
     private async Task WaitForOllamaAsync(CancellationToken ct)
     {
-        const int maxAttempts  = 30;   // 30 x 2s = up to 60 seconds
-        const int delayMs      = 2000;
-        var url = $"{_cfg.OllamaBaseUrl}/api/tags";
+        const int maxAttempts = 30;
+        const int delayMs     = 2000;
 
         for (int i = 0; i < maxAttempts; i++)
         {
@@ -309,17 +407,15 @@ public sealed class ZeroHost : BackgroundService
             yield return part;
     }
 
-    // ── Core agentic loop (shared by text, voice, and popup) ─────────────────
+    // ── Core agentic loop (shared by text, voice, popup, and wake word) ───────
 
     public async Task ProcessInputAsync(string userInput, CancellationToken hostCt)
     {
-        // Create a linked CTS so both host shutdown AND Ctrl+Shift+X can cancel
         using var turnCts = CancellationTokenSource.CreateLinkedTokenSource(hostCt);
         lock (_turnLock) { _turnCts = turnCts; }
 
         var ct = turnCts.Token;
 
-        // If tools not loaded yet, Ollama is still starting up — warn user
         if (_tools.Count == 0)
         {
             const string notReady = "Hold on, I'm still connecting to my brain. Give me a few seconds.";
@@ -331,6 +427,8 @@ public sealed class ZeroHost : BackgroundService
 
         _tray.SetState(TrayManager.TrayState.Processing);
         _history.Add(new ChatMessage { Role = "user", Content = userInput });
+
+        string? finalReply = null;
 
         try
         {
@@ -377,12 +475,12 @@ public sealed class ZeroHost : BackgroundService
                 }
 
                 // Final text reply
-                var reply = assistantMsg.Content ?? "(no response)";
-                Console.WriteLine($"\nZERO: {reply}\n");
+                finalReply = assistantMsg.Content ?? "(no response)";
+                Console.WriteLine($"\nZERO: {finalReply}\n");
 
                 if (_cfg.EnableTts)
                 {
-                    foreach (var sentence in SplitSentences(reply))
+                    foreach (var sentence in SplitSentences(finalReply))
                     {
                         if (ct.IsCancellationRequested) break;
                         try   { await _tts.SpeakAsync(sentence, ct); }
@@ -398,6 +496,19 @@ public sealed class ZeroHost : BackgroundService
         {
             lock (_turnLock) { _turnCts = null; }
             _tray.SetState(TrayManager.TrayState.Idle);
+
+            // Persist memory after every completed turn
+            if (_cfg.EnableMemory)
+                _memory.Save(_history);
+
+            // Tray balloon notification with reply snippet
+            if (finalReply is not null && _cfg.EnableReplyNotification && _cfg.NotificationMaxChars > 0)
+            {
+                var snippet = finalReply.Length > _cfg.NotificationMaxChars
+                    ? finalReply[.._cfg.NotificationMaxChars] + "…"
+                    : finalReply;
+                _tray.ShowNotification("ZERO", snippet);
+            }
         }
     }
 }

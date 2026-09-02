@@ -60,6 +60,8 @@ builder.Services.AddSingleton<HotkeyListener>();
 builder.Services.AddSingleton<SpeechRecognizer>();
 builder.Services.AddSingleton<KokoroTtsService>();
 builder.Services.AddSingleton<TrayManager>();
+builder.Services.AddSingleton<WakeWordListener>();
+builder.Services.AddSingleton<SessionMemory>();
 
 // ── Background services ───────────────────────────────────────────────────────
 builder.Services.AddHostedService<HotkeyListener>(sp => sp.GetRequiredService<HotkeyListener>());

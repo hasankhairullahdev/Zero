@@ -16,5 +16,15 @@
   "EnableStt": true,
   "KokoroVoice": "af_bella",
   "StartupGreeting": true,
-  "OllamaNumGpu": 33
+  "OllamaNumGpu": 33,
+
+  "EnableWakeWord": true,
+  "WakeWordThreshold": 0.5,
+
+  "EnableMemory": true,
+
+  "EnableDailyBriefing": true,
+
+  "EnableReplyNotification": true,
+  "NotificationMaxChars": 80
 }

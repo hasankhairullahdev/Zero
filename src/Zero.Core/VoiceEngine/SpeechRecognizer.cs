@@ -108,6 +108,22 @@ public sealed class SpeechRecognizer : IAsyncDisposable
         return Task.CompletedTask;
     }
 
+    /// <summary>
+    /// Transcribe a raw WAV byte array directly (used by wake word handler).
+    /// The array must be a valid 16kHz 16-bit mono WAV file.
+    /// </summary>
+    public async Task<string> TranscribeWavBytesAsync(byte[] wavBytes, CancellationToken ct = default)
+    {
+        if (!_initialised || _processorBuilder is null)
+            throw new InvalidOperationException("SpeechRecognizer not initialised.");
+
+        var t0   = DateTime.Now;
+        var text = await TranscribeAsync(wavBytes, ct);
+        _log.LogInformation("WakeWord transcribe: {Ms}ms → '{Text}'",
+            (int)(DateTime.Now - t0).TotalMilliseconds, text);
+        return text;
+    }
+
     /// <summary>Stop recording and return the transcribed text.</summary>
     public async Task<string> StopRecordingAsync(CancellationToken ct = default)
     {
