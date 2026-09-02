@@ -485,7 +485,7 @@ public sealed class ZeroHost : BackgroundService
             lock (_turnLock) { _turnCts = null; }
             _tray.SetState(TrayManager.TrayState.Idle);
 
-            // Persist memory after every completed turn
+            // Persist short-term memory after every turn + trim live context
             if (_cfg.EnableMemory)
                 _memory.Save(_history);
 
@@ -498,5 +498,14 @@ public sealed class ZeroHost : BackgroundService
                 _tray.ShowNotification("ZERO", snippet);
             }
         }
+    }
+
+    public override async Task StopAsync(CancellationToken ct)
+    {
+        // Update long-term summary when ZERO shuts down
+        if (_cfg.EnableMemory)
+            _memory.UpdateLongTermSummary(_history);
+
+        await base.StopAsync(ct);
     }
 }
