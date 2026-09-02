@@ -40,6 +40,9 @@ public sealed class ZeroConfig
     /// <summary>Path to Zero.WebAccess project (used to spawn MCP server).</summary>
     public string WebAccessProjectPath { get; set; } = "src/Zero.WebAccess/Zero.WebAccess.csproj";
 
+    /// <summary>Enable Playwright MCP server for browser automation. Requires Node.js + @playwright/mcp.</summary>
+    public bool EnablePlaywrightMcp { get; set; } = false;
+
     /// <summary>Whether to enable qwen3 thinking mode for complex queries.</summary>
     public bool EnableThinking { get; set; } = false;
 

@@ -10,6 +10,7 @@
   "FileManagerProjectPath": "src/Zero.FileManager/Zero.FileManager.csproj",
   "SystemControlProjectPath": "src/Zero.SystemControl/Zero.SystemControl.csproj",
   "WebAccessProjectPath": "src/Zero.WebAccess/Zero.WebAccess.csproj",
+  "EnablePlaywrightMcp": true,
   "EnableThinking": false,
   "WhisperModel": "Medium",
   "WhisperLanguage": "auto",

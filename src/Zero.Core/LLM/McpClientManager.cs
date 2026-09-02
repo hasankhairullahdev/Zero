@@ -18,6 +18,7 @@ public sealed class McpClientManager : IAsyncDisposable
     private IMcpClient? _fileManager;
     private IMcpClient? _systemControl;
     private IMcpClient? _webAccess;
+    private IMcpClient? _playwright;
 
     // Cached tool list exposed to Ollama
     private List<OllamaTool>? _toolCache;
@@ -43,6 +44,26 @@ public sealed class McpClientManager : IAsyncDisposable
         _webAccess = await McpClientFactory.CreateAsync(
             new StdioClientTransport(BuildTransportOptions("Zero.WebAccess", _cfg.WebAccessProjectPath)),
             cancellationToken: ct);
+
+        if (_cfg.EnablePlaywrightMcp)
+        {
+            try
+            {
+                _playwright = await McpClientFactory.CreateAsync(
+                    new StdioClientTransport(new StdioClientTransportOptions
+                    {
+                        Command   = "npx",
+                        Arguments = ["@playwright/mcp@latest", "--headless"],
+                        Name      = "Playwright"
+                    }),
+                    cancellationToken: ct);
+                _log.LogInformation("Playwright MCP client ready.");
+            }
+            catch (Exception ex)
+            {
+                _log.LogWarning(ex, "Playwright MCP failed to start — browser automation disabled.");
+            }
+        }
 
         _log.LogInformation("MCP clients ready.");
     }
@@ -84,7 +105,7 @@ public sealed class McpClientManager : IAsyncDisposable
 
         var tools = new List<OllamaTool>();
 
-        foreach (var client in new[] { _fileManager, _systemControl, _webAccess })
+        foreach (var client in new[] { _fileManager, _systemControl, _webAccess, _playwright })
         {
             if (client is null) continue;
             var mcpTools = await client.ListToolsAsync(cancellationToken: ct);
@@ -133,7 +154,7 @@ public sealed class McpClientManager : IAsyncDisposable
         Dictionary<string, object?>     arguments,
         CancellationToken               ct = default)
     {
-        foreach (var client in new[] { _fileManager, _systemControl, _webAccess })
+        foreach (var client in new[] { _fileManager, _systemControl, _webAccess, _playwright })
         {
             if (client is null) continue;
 
@@ -161,5 +182,6 @@ public sealed class McpClientManager : IAsyncDisposable
         if (_fileManager   is IAsyncDisposable fmD) await fmD.DisposeAsync();
         if (_systemControl is IAsyncDisposable scD) await scD.DisposeAsync();
         if (_webAccess     is IAsyncDisposable waD) await waD.DisposeAsync();
+        if (_playwright    is IAsyncDisposable pwD) await pwD.DisposeAsync();
     }
 }
