@@ -396,6 +396,14 @@ public sealed class ZeroHost : BackgroundService
 
         var ct = turnCts.Token;
 
+        // Wait up to 10s for tools to load (MCP init may still be in progress)
+        if (_tools.Count == 0)
+        {
+            _log.LogInformation("Waiting for tools to load...");
+            for (int i = 0; i < 20 && _tools.Count == 0; i++)
+                await Task.Delay(500, ct);
+        }
+
         if (_tools.Count == 0)
         {
             const string notReady = "Hold on, I'm still connecting to my brain. Give me a few seconds.";

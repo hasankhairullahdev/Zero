@@ -77,11 +77,12 @@ public sealed class WakeWordListener : IAsyncDisposable
     private readonly byte[] _frameAccum = new byte[FrameBytes];
     private int              _framePos;
 
-    // Noise floor (measured at startup over first 1s of audio)
-    private double  _noiseFloor     = 0.008; // conservative default
+    // Noise floor (measured over first ~4s of audio, 50 × 80ms frames)
+    private double  _noiseFloor     = 0.01; // conservative default until measured
     private int     _noiseFrames;
     private double  _noiseAccum;
     private bool    _noiseMeasured;
+    private const int NoiseCalibFrames = 50;
 
     // Post-wake capture state
     private volatile bool   _paused;
@@ -221,15 +222,15 @@ public sealed class WakeWordListener : IAsyncDisposable
             return;
         }
 
-        // Measure noise floor from first ~1s of audio (16 × 1280-sample frames)
+        // Measure noise floor from first ~4s of audio (50 × 80ms frames)
         if (!_noiseMeasured)
         {
             double rms = ComputeRms(e.Buffer, e.BytesRecorded);
             _noiseAccum += rms;
             _noiseFrames++;
-            if (_noiseFrames >= 16)
+            if (_noiseFrames >= NoiseCalibFrames)
             {
-                _noiseFloor  = _noiseAccum / _noiseFrames;
+                _noiseFloor    = Math.Max(_noiseAccum / _noiseFrames, 0.002);
                 _noiseMeasured = true;
                 _log.LogInformation("Wake word noise floor measured: {Rms:F4}", _noiseFloor);
             }
