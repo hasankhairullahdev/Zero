@@ -10,73 +10,81 @@ namespace Zero.Core.VoiceEngine;
 /// Always-on wake word listener using OpenWakeWord ONNX model (hey_jarvis).
 /// Architecture:
 ///   MIC (NAudio, 16kHz, continuous)
-///    → 80ms audio frames fed into a ring buffer
-///    → OpenWakeWord ONNX scores each frame (~1ms/frame, CPU)
-///    → score > threshold → capture post-wake audio via VAD
-///    → return captured PCM bytes to ZeroHost for Whisper STT
+///    → 1280-sample (80ms) audio chunks
+///    → melspectrogram.onnx: [1, 1280] → [1, 1, 5, 32] mel features
+///    → rolling 48-frame mel buffer maintained in RAM
+///    → reshape [48, 32] → [1, 16, 96] → hey_jarvis_v0.1.onnx → score
+///    → score > threshold → VAD capture post-wake audio
+///    → return captured WAV bytes to ZeroHost for Whisper STT
 ///
-/// Audio is NEVER written to disk. Only a ~4s ring buffer lives in RAM.
-/// Model is auto-downloaded from GitHub releases on first run.
+/// Audio is NEVER written to disk. Only a 3s ring buffer lives in RAM.
+/// Models are auto-downloaded from GitHub releases on first run.
 /// </summary>
 public sealed class WakeWordListener : IAsyncDisposable
 {
-    // ── Public API ─────────────────────────────────────────────────────────────
+    // ── Events ────────────────────────────────────────────────────────────────
     /// <summary>Fired on thread pool with the captured post-wake PCM WAV bytes.</summary>
     public event EventHandler<byte[]>? WakeWordDetected;
 
-    // ── Constants ──────────────────────────────────────────────────────────────
-    private static readonly WaveFormat WavFmt = new(16000, 16, 1); // 16kHz, 16-bit, mono
+    // ── Audio constants ───────────────────────────────────────────────────────
+    private static readonly WaveFormat WavFmt = new(16000, 16, 1);
+    private const int FrameSamples  = 1280;           // 80ms at 16kHz
+    private const int FrameBytes    = FrameSamples * 2; // 16-bit
+    private const int RingSeconds   = 3;
+    private const int RingBytes     = 16000 * 2 * RingSeconds;
 
-    private const int FrameMs         = 80;    // OWW processes 80ms frames
-    private const int FrameSamples    = 16000 * FrameMs / 1000;   // 1280 samples
-    private const int FrameBytes      = FrameSamples * 2;          // 2560 bytes (16-bit)
-    private const int RingSeconds     = 3;
-    private const int RingBytes       = 16000 * 2 * RingSeconds;   // ~96 KB
-    private const int CaptureMaxMs    = 6000;  // max post-wake capture window
-    private const int SilenceMs       = 1200;  // stop capture after this silence
-    private const double WakeThreshold = 0.5;  // OWW confidence threshold
-    private const double SilenceEnergy = 0.005; // RMS energy below = silence
+    // ── OWW pipeline constants ────────────────────────────────────────────────
+    // melspectrogram: [1, 1280] → [1, 1, 5, 32]  (5 mel frames per audio chunk)
+    // hey_jarvis:     [1, 16, 96]                 (16 windows × 96 = 3×32 stacked)
+    private const int MelPerChunk  = 5;   // mel time-steps produced per 1280-sample chunk
+    private const int MelFeatures  = 32;
+    private const int WwWindows    = 16;
+    private const int WwStackSize  = 3;                         // mel frames stacked per window
+    private const int MelBufSize   = WwWindows * WwStackSize;   // 48 mel frames total
 
+    // ── Capture / VAD ─────────────────────────────────────────────────────────
+    private const int CaptureMaxMs   = 6000;
+    private const int SilenceMs      = 1200;
+    private const double SilenceRms  = 0.005;
+
+    // ── Model URLs ────────────────────────────────────────────────────────────
     private static readonly string ModelDir =
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                      "ZERO", "models");
 
-    private const string ModelFileName = "hey_jarvis_v0.1.onnx";
-    private const string ModelUrl =
-        "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/hey_jarvis_v0.1.onnx";
+    private const string MelFileName = "melspectrogram.onnx";
+    private const string WwFileName  = "hey_jarvis_v0.1.onnx";
+    private const string MelUrl = "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/melspectrogram.onnx";
+    private const string WwUrl  = "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/hey_jarvis_v0.1.onnx";
 
-    // ── State ──────────────────────────────────────────────────────────────────
-    private readonly ZeroConfig                 _cfg;
-    private readonly ILogger<WakeWordListener>  _log;
+    // ── State ─────────────────────────────────────────────────────────────────
+    private readonly ZeroConfig                _cfg;
+    private readonly ILogger<WakeWordListener> _log;
 
-    private InferenceSession? _session;
+    private InferenceSession? _melSession;
+    private InferenceSession? _wwSession;
 
-    private WaveInEvent?       _waveIn;
-    private readonly byte[]    _ring    = new byte[RingBytes];
-    private int                _ringPos;                 // write position in ring buffer
-    private readonly byte[]    _frameAccum = new byte[FrameBytes]; // accumulate until full frame
-    private int                _framePos;
+    // Rolling mel feature buffer [MelBufSize, MelFeatures]
+    private readonly float[] _melBuf = new float[MelBufSize * MelFeatures];
 
-    private volatile bool      _paused;
-    private volatile bool      _capturing;   // true while recording post-wake audio
-    private MemoryStream?      _captureStream;
-    private WaveFileWriter?    _captureWriter;
-    private int                _silenceSamples;
-    private int                _capturedSamples;
+    // Audio ring buffer (raw PCM, never written to disk)
+    private readonly byte[] _ring    = new byte[RingBytes];
+    private int              _ringPos;
 
-    private CancellationTokenSource? _cts;
+    // Audio frame accumulator
+    private readonly byte[] _frameAccum = new byte[FrameBytes];
+    private int              _framePos;
 
-    // ── OWW internal melspectrogram state ─────────────────────────────────────
-    // OWW expects a rolling 76-frame (80ms each = ~6s) mel feature history.
-    // We maintain it as a float[1, 76, 32] tensor updated every frame.
-    private const int MelFrames   = 76;
-    private const int MelFeatures = 32;
-    private readonly float[,,] _melHistory = new float[1, MelFrames, MelFeatures];
-    private InferenceSession?  _melSession;  // melspectrogram feature extractor
+    // Post-wake capture state
+    private volatile bool   _paused;
+    private volatile bool   _capturing;
+    private MemoryStream?   _captureStream;
+    private WaveFileWriter? _captureWriter;
+    private int             _silenceSamples;
+    private int             _capturedSamples;
 
-    private const string MelModelFileName = "melspectrogram.onnx";
-    private const string MelModelUrl =
-        "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1/melspectrogram.onnx";
+    private WaveInEvent?              _waveIn;
+    private CancellationTokenSource?  _cts;
 
     public WakeWordListener(IOptions<ZeroConfig> cfg, ILogger<WakeWordListener> log)
     {
@@ -84,23 +92,22 @@ public sealed class WakeWordListener : IAsyncDisposable
         _log = log;
     }
 
-    // ── Initialise ─────────────────────────────────────────────────────────────
+    // ── Initialise ────────────────────────────────────────────────────────────
 
     public async Task InitialiseAsync(CancellationToken ct = default)
     {
         Directory.CreateDirectory(ModelDir);
-
-        await EnsureModelAsync(MelModelFileName, MelModelUrl, ct);
-        await EnsureModelAsync(ModelFileName,    ModelUrl,    ct);
+        await EnsureModelAsync(MelFileName, MelUrl, ct);
+        await EnsureModelAsync(WwFileName,  WwUrl,  ct);
 
         var opts = new SessionOptions();
         opts.AppendExecutionProvider_CPU();
 
-        _melSession = new InferenceSession(Path.Combine(ModelDir, MelModelFileName), opts);
-        _session    = new InferenceSession(Path.Combine(ModelDir, ModelFileName),    opts);
+        _melSession = new InferenceSession(Path.Combine(ModelDir, MelFileName), opts);
+        _wwSession  = new InferenceSession(Path.Combine(ModelDir, WwFileName),  opts);
 
         _log.LogInformation("OpenWakeWord ready (model={Model}, threshold={T})",
-            ModelFileName, WakeThreshold);
+            WwFileName, _cfg.WakeWordThreshold);
     }
 
     private async Task EnsureModelAsync(string fileName, string url, CancellationToken ct)
@@ -109,21 +116,21 @@ public sealed class WakeWordListener : IAsyncDisposable
         if (File.Exists(path)) return;
 
         _log.LogInformation("Downloading wake word model: {File}...", fileName);
-        using var http   = new HttpClient();
+        using var http  = new HttpClient();
         await using var resp = await http.GetStreamAsync(url, ct);
         await using var fs   = File.OpenWrite(path);
         await resp.CopyToAsync(fs, ct);
         _log.LogInformation("Wake word model downloaded: {File}", fileName);
     }
 
-    // ── Start / Stop ───────────────────────────────────────────────────────────
+    // ── Start / Stop ──────────────────────────────────────────────────────────
 
     public Task StartAsync(CancellationToken ct = default)
     {
-        if (!_cfg.EnableWakeWord || _session is null) return Task.CompletedTask;
+        if (!_cfg.EnableWakeWord || _wwSession is null) return Task.CompletedTask;
 
         _cts    = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        _waveIn = new WaveInEvent { WaveFormat = WavFmt, BufferMilliseconds = FrameMs };
+        _waveIn = new WaveInEvent { WaveFormat = WavFmt, BufferMilliseconds = 40 };
         _waveIn.DataAvailable    += OnData;
         _waveIn.StartRecording();
 
@@ -140,27 +147,24 @@ public sealed class WakeWordListener : IAsyncDisposable
         return Task.CompletedTask;
     }
 
-    /// <summary>Pause wake word detection while main pipeline is active (avoids mic contention).</summary>
     public void Pause()  => _paused = true;
 
-    /// <summary>Resume detection after main pipeline finishes.</summary>
     public void Resume()
     {
-        _paused    = false;
         _capturing = false;
-        _captureStream?.Dispose();
         _captureWriter?.Dispose();
-        _captureStream  = null;
-        _captureWriter  = null;
+        _captureStream?.Dispose();
+        _captureWriter = null;
+        _captureStream = null;
+        _paused        = false;
     }
 
-    // ── Audio data handler (called on NAudio thread) ───────────────────────────
+    // ── NAudio data handler ───────────────────────────────────────────────────
 
     private void OnData(object? sender, WaveInEventArgs e)
     {
         if (_paused || _cts?.IsCancellationRequested == true) return;
 
-        // Write raw bytes into the ring buffer for potential post-wake retrieval
         WriteRing(e.Buffer, e.BytesRecorded);
 
         if (_capturing)
@@ -169,7 +173,7 @@ public sealed class WakeWordListener : IAsyncDisposable
             return;
         }
 
-        // Accumulate into 80ms frame
+        // Accumulate into 1280-sample frames
         int src = 0;
         while (src < e.BytesRecorded)
         {
@@ -186,68 +190,87 @@ public sealed class WakeWordListener : IAsyncDisposable
         }
     }
 
+    // ── OWW inference pipeline ────────────────────────────────────────────────
+
     private void ProcessFrame(byte[] frameBytes)
     {
-        if (_session is null || _melSession is null) return;
+        if (_melSession is null || _wwSession is null) return;
 
-        // Convert 16-bit PCM → float32 normalised [-1, 1]
-        var samples = new float[FrameSamples];
+        // 1. Convert PCM 16-bit → float32 normalised [-1, 1]
+        var audio = new float[FrameSamples];
         for (int i = 0; i < FrameSamples; i++)
-            samples[i] = BitConverter.ToInt16(frameBytes, i * 2) / 32768f;
+            audio[i] = BitConverter.ToInt16(frameBytes, i * 2) / 32768f;
 
-        // Run mel spectrogram extractor
-        var audioTensor = new DenseTensor<float>(samples, [1, FrameSamples]);
-        using var melResult = _melSession.Run(
-        [
-            NamedOnnxValue.CreateFromTensor("input", audioTensor)
-        ]);
+        // 2. Run melspectrogram: [1, 1280] → [1, 1, 5, 32]
+        var audioTensor = new DenseTensor<float>(audio, [1, FrameSamples]);
+        float[] melFrames;
+        try
+        {
+            using var melResult = _melSession.Run(
+                [NamedOnnxValue.CreateFromTensor("input", audioTensor)]);
+            melFrames = melResult.First().AsEnumerable<float>().ToArray(); // 5*32 = 160 values
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Melspectrogram inference failed.");
+            return;
+        }
 
-        var melFrame = melResult.First().AsEnumerable<float>().ToArray(); // [1, 1, 32]
+        // 3. Shift mel buffer left by MelPerChunk (5) rows, append new frames
+        //    Buffer layout: [MelBufSize * MelFeatures] = flat row-major [48, 32]
+        int shiftBytes = (MelBufSize - MelPerChunk) * MelFeatures;
+        Buffer.BlockCopy(_melBuf, MelPerChunk * MelFeatures * sizeof(float),
+                         _melBuf, 0,
+                         shiftBytes * sizeof(float));
+        Buffer.BlockCopy(melFrames, 0,
+                         _melBuf, shiftBytes * sizeof(float),
+                         melFrames.Length * sizeof(float));
 
-        // Shift mel history left by 1 and append new frame
-        for (int t = 0; t < MelFrames - 1; t++)
-            for (int f = 0; f < MelFeatures; f++)
-                _melHistory[0, t, f] = _melHistory[0, t + 1, f];
+        // 4. Reshape [48, 32] → [1, 16, 96]  (stack 3 consecutive mel rows per window)
+        var wwInput = new float[1 * WwWindows * (WwStackSize * MelFeatures)];
+        for (int w = 0; w < WwWindows; w++)
+        {
+            int srcRow = w * WwStackSize;
+            int dstOff = w * WwStackSize * MelFeatures;
+            Buffer.BlockCopy(_melBuf, srcRow * MelFeatures * sizeof(float),
+                             wwInput, dstOff * sizeof(float),
+                             WwStackSize * MelFeatures * sizeof(float));
+        }
 
-        for (int f = 0; f < MelFeatures && f < melFrame.Length; f++)
-            _melHistory[0, MelFrames - 1, f] = melFrame[f];
+        // 5. Run hey_jarvis: [1, 16, 96] → [1, 1] score
+        float score;
+        try
+        {
+            var wwTensor = new DenseTensor<float>(wwInput, [1, WwWindows, WwStackSize * MelFeatures]);
+            using var wwResult = _wwSession.Run(
+                [NamedOnnxValue.CreateFromTensor("x.1", wwTensor)]);
+            score = wwResult.First().AsEnumerable<float>().First();
+        }
+        catch (Exception ex)
+        {
+            _log.LogWarning(ex, "Wake word inference failed.");
+            return;
+        }
 
-        // Build mel input tensor [1, 76, 32]
-        var flat = new float[MelFrames * MelFeatures];
-        for (int t = 0; t < MelFrames; t++)
-            for (int f = 0; f < MelFeatures; f++)
-                flat[t * MelFeatures + f] = _melHistory[0, t, f];
-
-        var melTensor = new DenseTensor<float>(flat, [1, MelFrames, MelFeatures]);
-
-        // Run wake word model
-        using var wakeResult = _session.Run(
-        [
-            NamedOnnxValue.CreateFromTensor("input", melTensor)
-        ]);
-
-        float score = wakeResult.First().AsEnumerable<float>().First();
-
-        if (score >= WakeThreshold)
+        if (score >= (float)_cfg.WakeWordThreshold)
         {
             _log.LogInformation("Wake word detected! Score={Score:F3}", score);
             BeginCapture();
         }
     }
 
-    // ── Post-wake capture (VAD-based) ─────────────────────────────────────────
+    // ── Post-wake VAD capture ─────────────────────────────────────────────────
 
     private void BeginCapture()
     {
-        _capturing        = true;
-        _silenceSamples   = 0;
-        _capturedSamples  = 0;
-        _captureStream    = new MemoryStream();
-        _captureWriter    = new WaveFileWriter(_captureStream, WavFmt);
+        _capturing       = true;
+        _silenceSamples  = 0;
+        _capturedSamples = 0;
+        _captureStream   = new MemoryStream();
+        _captureWriter   = new WaveFileWriter(_captureStream, WavFmt);
 
-        // Prepend last ~0.5s of ring buffer so we catch any partial word after wake word
-        int prePadBytes = Math.Min(16000 * 2 / 2, RingBytes); // 0.5s
-        var pre = ReadRingLast(prePadBytes);
+        // Prepend last 0.5s of ring buffer (catches any trailing command words)
+        var pre = ReadRingLast(16000 * 2 / 2);
         _captureWriter.Write(pre, 0, pre.Length);
         _capturedSamples += pre.Length / 2;
     }
@@ -259,7 +282,7 @@ public sealed class WakeWordListener : IAsyncDisposable
         _captureWriter.Write(buf, 0, count);
         _capturedSamples += count / 2;
 
-        // VAD: measure RMS energy of this chunk
+        // Measure RMS energy for VAD
         double rms = 0;
         for (int i = 0; i + 1 < count; i += 2)
         {
@@ -268,36 +291,29 @@ public sealed class WakeWordListener : IAsyncDisposable
         }
         rms = Math.Sqrt(rms / (count / 2));
 
-        int silenceThreshSamples = WavFmt.SampleRate * SilenceMs / 1000;
-        int captureMaxSamples    = WavFmt.SampleRate * CaptureMaxMs / 1000;
+        if (rms < SilenceRms) _silenceSamples += count / 2;
+        else                   _silenceSamples  = 0;
 
-        if (rms < SilenceEnergy)
-            _silenceSamples += count / 2;
-        else
-            _silenceSamples = 0;
+        bool silenceMet = _silenceSamples  >= WavFmt.SampleRate * SilenceMs / 1000;
+        bool maxReached = _capturedSamples >= WavFmt.SampleRate * CaptureMaxMs / 1000;
 
-        bool silenceMet  = _silenceSamples  >= silenceThreshSamples;
-        bool maxReached  = _capturedSamples >= captureMaxSamples;
+        if (!silenceMet && !maxReached) return;
 
-        if (silenceMet || maxReached)
-        {
-            _capturing = false;
-            _captureWriter.Flush();
-            var wavBytes = _captureStream.ToArray();
-            _captureWriter.Dispose();
-            _captureStream.Dispose();
-            _captureWriter = null;
-            _captureStream = null;
+        _capturing = false;
+        _captureWriter.Flush();
+        var wavBytes = _captureStream.ToArray();
+        _captureWriter.Dispose();
+        _captureStream.Dispose();
+        _captureWriter = null;
+        _captureStream = null;
 
-            _log.LogInformation("Post-wake capture done: {Bytes} bytes ({Reason})",
-                wavBytes.Length, silenceMet ? "silence" : "max length");
+        _log.LogInformation("Post-wake capture: {Bytes} bytes ({Reason})",
+            wavBytes.Length, silenceMet ? "silence" : "max");
 
-            // Fire on thread pool — don't block NAudio callback
-            Task.Run(() => WakeWordDetected?.Invoke(this, wavBytes));
-        }
+        Task.Run(() => WakeWordDetected?.Invoke(this, wavBytes));
     }
 
-    // ── Ring buffer helpers ────────────────────────────────────────────────────
+    // ── Ring buffer ───────────────────────────────────────────────────────────
 
     private void WriteRing(byte[] buf, int count)
     {
@@ -323,8 +339,8 @@ public sealed class WakeWordListener : IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         await StopAsync();
-        _session?.Dispose();
         _melSession?.Dispose();
+        _wwSession?.Dispose();
         _captureWriter?.Dispose();
         _captureStream?.Dispose();
         _cts?.Dispose();
